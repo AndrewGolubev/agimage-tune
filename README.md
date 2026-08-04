@@ -74,4 +74,4 @@ MIT — see [LICENSE](LICENSE). Free to use, modify, and share.
 
 ---
 
-Made with ❤️ by [ndrew Golubev]
+Made with ❤️ by Andrew Golubev
