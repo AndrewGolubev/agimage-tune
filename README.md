@@ -31,6 +31,10 @@ landscapes, and stylized renders.
 
 ## Quick Start
 
+**Portable GUI version for Windows:**
+
+Download and run AGImageTune.exe
+
 **GIMP plugin:**
 
 1. Copy the `gimp-plugin/agimage` folder into your GIMP plug-ins directory
