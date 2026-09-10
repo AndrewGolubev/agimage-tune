@@ -1,5 +1,7 @@
 # AG Image Tune — Soft Glow Effect for GIMP 3.2
 
+![](https://github.com/AndrewGolubev/agimage-tune/blob/main/example.png)
+
 A one-click **soft-glow / dreamy light** effect for images, available in two
 flavors:
 
