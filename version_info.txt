@@ -1,0 +1,44 @@
+# UTF-8
+#
+# PyInstaller version resource for AGImageTune.exe.
+# Passed to the build with:  --version-file version_info.txt
+#
+# Why it exists: an unsigned executable with NO version metadata is one of the
+# cheapest things a heuristic AV/ML engine can hold against a file. Filling in
+# CompanyName / ProductName / FileDescription gives the scanner something real
+# to read instead of "unknown binary".
+#
+# Keep FileVersion / ProductVersion in sync with the README ("Since 2.1").
+#
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(2, 1, 0, 0),
+    prodvers=(2, 1, 0, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo(
+      [
+        StringTable(
+          '040904B0',
+          [
+            StringStruct('CompanyName', 'Andrew Golubev'),
+            StringStruct('FileDescription', 'AG Image Tune - soft glow batch processor'),
+            StringStruct('FileVersion', '2.1.0.0'),
+            StringStruct('InternalName', 'AGImageTune'),
+            StringStruct('LegalCopyright', 'Copyright (c) 2026 Andrew Golubev. MIT License.'),
+            StringStruct('OriginalFilename', 'AGImageTune.exe'),
+            StringStruct('ProductName', 'AG Image Tune'),
+            StringStruct('ProductVersion', '2.1.0.0')
+          ]
+        )
+      ]
+    ),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
