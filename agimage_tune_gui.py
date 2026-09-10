@@ -77,8 +77,96 @@ DEFAULT_THEME = "light"
 CONFIG_PATH = Path.home() / ".agimage_tune.json"
 
 
-def soft_glow(img, blur=3.5, top_opacity=25.0, merged_opacity=80.0):
-    """Apply the AG Image Tune soft-glow effect to a single image."""
+# ---------------------------------------------------------------------------
+# LAB chroma curve — a Python port of this GIMP workflow:
+#     Colors > Components > Decompose  (model LAB, "Decompose to layers")
+#     Curves on layer "A" and layer "B"  (e.g. the points 30->0 and 220->255)
+#     Colors > Components > Compose
+# The same functions plus a command-line front end live in lab_tune.py, which
+# test_lab_tune.py exercises; keep the two copies in sync.
+#
+# Pillow's "LAB" mode is D50-referenced CIE Lab encoded as L* * 255/100,
+# a* + 128, b* + 128 — the same numbers GIMP puts in the "L", "A" and "B"
+# layers, so the control points can be typed straight across.
+# ---------------------------------------------------------------------------
+IDENTITY_POINTS = ((0, 0), (255, 255))
+DEFAULT_LAB_POINTS = ((30, 0), (220, 255))
+
+
+def build_curve_lut(points, size=256):
+    """Piecewise-linear curve -> list of `size` output values.
+
+    `points` is an iterable of (x, y) pairs in 0..255, x strictly increasing.
+    Missing endpoints x=0 and x=size-1 are added as (0,0) and (255,255),
+    matching GIMP's Curves behaviour.
+    """
+    pts = sorted((int(x), int(y)) for x, y in points)
+
+    seen = set()
+    clean = []
+    for x, y in pts:
+        if x in seen:
+            raise ValueError(f"duplicate control point at x={x}")
+        seen.add(x)
+        clean.append((x, y))
+    pts = clean
+
+    if pts and pts[0][0] < 0:
+        raise ValueError("control point x must be >= 0")
+    if pts and pts[-1][0] > size - 1:
+        raise ValueError(f"control point x must be <= {size - 1}")
+
+    if not pts or pts[0][0] != 0:
+        pts.insert(0, (0, 0))
+    if pts[-1][0] != size - 1:
+        pts.append((size - 1, size - 1))
+
+    lut = []
+    for i in range(size):
+        k = 0
+        while k < len(pts) - 2 and pts[k + 1][0] < i:
+            k += 1
+        x0, y0 = pts[k]
+        x1, y1 = pts[k + 1]
+        value = y0 if x1 == x0 else y0 + (y1 - y0) * (i - x0) / (x1 - x0)
+        lut.append(max(0, min(255, int(round(value)))))
+    return lut
+
+
+def apply_ab_curves(lab, a_lut=None, b_lut=None):
+    """Remap the a*/b* bands of a Pillow "LAB" image; L is left untouched."""
+    lightness, a_chan, b_chan = lab.split()
+    if a_lut is not None:
+        a_chan = a_chan.point(a_lut)
+    if b_lut is not None:
+        b_chan = b_chan.point(b_lut)
+    return Image.merge("LAB", (lightness, a_chan, b_chan))
+
+
+def lab_ab_curve(img, a_points=IDENTITY_POINTS, b_points=IDENTITY_POINTS):
+    """Remap the Lab a* and b* channels of `img` and return an RGB image."""
+    alpha = img.getchannel("A") if "A" in img.getbands() else None
+    lab = img.convert("RGB").convert("LAB")
+    merged = apply_ab_curves(lab, build_curve_lut(a_points),
+                             build_curve_lut(b_points))
+    rgb = merged.convert("RGB")
+    if alpha is not None:
+        rgb.putalpha(alpha)
+    return rgb
+
+
+def soft_glow(img, blur=3.5, top_opacity=25.0, merged_opacity=80.0,
+              lab_a_points=None, lab_b_points=None):
+    """Apply the AG Image Tune soft-glow effect to a single image.
+
+    When `lab_a_points` / `lab_b_points` are given, the Lab a*/b* channels are
+    remapped first (the GIMP "Decompose to LAB + Curves" step). Pass None for
+    a channel to leave it alone.
+    """
+    if lab_a_points or lab_b_points:
+        img = lab_ab_curve(img,
+                           lab_a_points or IDENTITY_POINTS,
+                           lab_b_points or IDENTITY_POINTS)
     base = img.convert("RGB")
     dup1 = base.copy()
 
@@ -156,6 +244,14 @@ class AgImageApp:
         self.top_label = tk.StringVar(value="25 %")
         self.merged_label = tk.StringVar(value="80 %")
 
+        # LAB chroma curve: 4 numbers per channel (x1, y1, x2, y2).
+        self.lab_on = tk.BooleanVar(value=False)
+        self.lab_vars = {
+            ch: [tk.IntVar(value=v) for v in (30, 0, 220, 255)]
+            for ch in ("A", "B")
+        }
+        self.lab_widgets = []
+
         self._cancel = threading.Event()
         self._thread = None
         self._queue = queue.Queue()
@@ -163,6 +259,9 @@ class AgImageApp:
 
         self._build_toolbar()
         self._build_ui()
+        # Restore the saved LAB points *before* applying the theme, because
+        # _apply_theme saves the current state back to the config file.
+        self._load_lab()
         self._apply_theme(self._load_theme())
 
     # ----- UI construction ------------------------------------------------
@@ -195,6 +294,36 @@ class AgImageApp:
                      0.0, 100.0, lambda v: f"{v:.0f} %")
         self._slider(frm2, 2, "Soft-light opacity", self.merged_var,
                      self.merged_label, 0.0, 100.0, lambda v: f"{v:.0f} %")
+
+        # LAB chroma curve (optional pre-step)
+        frm5 = ttk.LabelFrame(self.root, text="LAB chroma curve (optional)",
+                              padding=10)
+        frm5.pack(fill="x", padx=10, pady=6)
+
+        ttk.Checkbutton(
+            frm5,
+            text="Remap the Lab a*/b* channels first "
+                 "(GIMP: Decompose to LAB → Curves → Compose)",
+            variable=self.lab_on, command=self._lab_toggle
+        ).grid(row=0, column=0, columnspan=5, sticky="w", pady=(0, 6))
+
+        for col, head in enumerate(("Channel", "point 1  in / out",
+                                    "", "point 2  in / out", "")):
+            ttk.Label(frm5, text=head).grid(row=1, column=col, sticky="w", padx=3)
+
+        for i, ch in enumerate(("A", "B")):
+            row = 2 + i
+            ttk.Label(frm5, text=ch).grid(row=row, column=0, sticky="w", padx=3)
+            for j, var in enumerate(self.lab_vars[ch]):
+                spin = ttk.Spinbox(frm5, from_=0, to=255, width=5,
+                                   textvariable=var, justify="center")
+                spin.grid(row=row, column=1 + j, padx=3, pady=2)
+                self.lab_widgets.append(spin)
+
+        ttk.Label(frm5, text="(values are the layer numbers from GIMP's Curves "
+                             "dialog: input → output)").grid(
+            row=4, column=0, columnspan=5, sticky="w", pady=(6, 0))
+        self._lab_toggle()
 
         # Actions
         frm3 = ttk.Frame(self.root)
@@ -229,6 +358,33 @@ class AgImageApp:
         ttk.Label(parent, textvariable=label_var, width=9,
                   anchor="e").grid(row=row, column=2)
 
+    # ----- LAB chroma curve ----------------------------------------------
+    def _lab_toggle(self):
+        state = "normal" if self.lab_on.get() else "disabled"
+        for spin in self.lab_widgets:
+            spin.configure(state=state)
+
+    def _lab_points(self):
+        """(a_points, b_points) or (None, None) when the option is off.
+
+        Raises ValueError with a readable message if the numbers can't form a
+        curve (a repeated input value), so the caller can show a dialog.
+        """
+        if not self.lab_on.get():
+            return None, None
+        out = []
+        for ch in ("A", "B"):
+            vars_ = self.lab_vars[ch]
+            try:
+                x1, y1, x2, y2 = (v.get() for v in vars_)
+            except tk.TclError:
+                raise ValueError(
+                    f"Channel {ch}: every box needs a whole number 0–255.")
+            points = ((x1, y1), (x2, y2))
+            build_curve_lut(points)  # validates; raises ValueError if unusable
+            out.append(points)
+        return out[0], out[1]
+
     def _log(self, msg):
         self.txt.configure(state="normal")
         self.txt.insert("end", msg + "\n")
@@ -257,10 +413,16 @@ class AgImageApp:
         if not path:
             return
         try:
+            a_pts, b_pts = self._lab_points()
+        except ValueError as e:  # noqa: BLE001
+            messagebox.showerror("LAB chroma curve", str(e))
+            return
+        try:
             src = Image.open(path)
             result = soft_glow(src, blur=self.blur_var.get(),
                                top_opacity=self.top_var.get(),
-                               merged_opacity=self.merged_var.get())
+                               merged_opacity=self.merged_var.get(),
+                               lab_a_points=a_pts, lab_b_points=b_pts)
         except Exception as e:  # noqa: BLE001
             messagebox.showerror("Preview", f"Could not open or process image:\n{e}")
             return
@@ -310,10 +472,18 @@ class AgImageApp:
                 "The originals would be overwritten — choose a different destination.")
             return
 
+        try:
+            a_pts, b_pts = self._lab_points()
+        except ValueError as e:  # noqa: BLE001
+            messagebox.showerror("LAB chroma curve", str(e))
+            return
+
         kwargs = {
             "blur": self.blur_var.get(),
             "top_opacity": self.top_var.get(),
             "merged_opacity": self.merged_var.get(),
+            "lab_a_points": a_pts,
+            "lab_b_points": b_pts,
         }
         self._cancel.clear()
         self._set_running(True)
@@ -322,6 +492,14 @@ class AgImageApp:
         self._log(f"Settings: blur={kwargs['blur']:.1f}, "
                   f"top={kwargs['top_opacity']:.0f}%, "
                   f"merged={kwargs['merged_opacity']:.0f}%")
+        if a_pts or b_pts:
+            for ch, pts in (("A", a_pts), ("B", b_pts)):
+                if pts:
+                    self._log(f"LAB {ch} curve: {pts[0][0]}->{pts[0][1]}, "
+                              f"{pts[1][0]}->{pts[1][1]}")
+                else:
+                    self._log(f"LAB {ch} curve: unchanged")
+        self._save_config()
 
         self._thread = threading.Thread(
             target=self._worker, args=(src, dst, kwargs), daemon=True)
@@ -461,17 +639,46 @@ class AgImageApp:
             self._about_win = None
 
     def _load_theme(self):
-        try:
-            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-            if data.get("theme") in THEMES:
-                return data["theme"]
-        except Exception:  # noqa: BLE001
-            pass
+        data = self._load_config()
+        if data.get("theme") in THEMES:
+            return data["theme"]
         return DEFAULT_THEME
 
-    def _save_theme(self, name):
+    def _load_lab(self):
+        """Restore the LAB curve controls; silently ignores anything malformed."""
+        data = self._load_config().get("lab")
+        if not isinstance(data, dict):
+            return
         try:
-            CONFIG_PATH.write_text(json.dumps({"theme": name}),
+            self.lab_on.set(bool(data.get("on", False)))
+            points = data.get("points", {})
+            for ch in ("A", "B"):
+                vals = points.get(ch)
+                if isinstance(vals, list) and len(vals) == 4:
+                    for var, value in zip(self.lab_vars[ch], vals):
+                        var.set(int(value))
+        except (TypeError, ValueError, tk.TclError):
+            pass
+        self._lab_toggle()
+
+    @staticmethod
+    def _load_config():
+        try:
+            data = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else {}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def _save_config(self):
+        try:
+            data = self._load_config()
+            data["theme"] = self._theme_var.get()
+            data["lab"] = {
+                "on": bool(self.lab_on.get()),
+                "points": {ch: [int(v.get()) for v in self.lab_vars[ch]]
+                           for ch in ("A", "B")},
+            }
+            CONFIG_PATH.write_text(json.dumps(data, indent=2),
                                    encoding="utf-8")
         except Exception:  # noqa: BLE001
             pass
@@ -558,7 +765,7 @@ class AgImageApp:
                                   disabledforeground=t["disabled_fg"],
                                   activeborderwidth=0, borderwidth=0)
 
-        self._save_theme(name)
+        self._save_config()
 
 
 def main():
