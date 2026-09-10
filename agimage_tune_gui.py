@@ -13,13 +13,16 @@ The result is dist/AGImageTune.exe — one file, no Python required on the
 target machine.
 """
 import json
+import os
 import queue
 import sys
 import threading
 import tkinter as tk
 import webbrowser
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from tkinter import filedialog, messagebox, ttk
+from tkinter import filedialog, ttk
+from typing import Optional
 
 from PIL import Image, ImageChops, ImageFilter, ImageOps, ImageTk
 
@@ -29,6 +32,27 @@ IMAGE_TYPES = [
     ("Images", "*.jpg *.jpeg *.png *.webp *.bmp *.tif *.tiff"),
     ("All files", "*.*"),
 ]
+
+# How many images to process at once. Pillow releases the GIL inside the heavy
+# pixel work (blur, codecs), so plain threads give a real multi-core speedup —
+# no multiprocessing, no pickling, nothing extra to bundle into the .exe.
+# Capped because every worker holds several full-size RGB buffers (≈5 x W x H
+# x 3 bytes): 8 workers on 24 MP photos is already ~2 GB peak.
+AUTO_WORKERS_CAP = 8
+
+# .png outputs only. zlib level 6 is Pillow's default; level 1 writes roughly
+# 3x faster for ~20% bigger files (the pixels are identical — PNG is lossless).
+# Lower it here if you process PNGs and care more about speed than file size.
+PNG_COMPRESS_LEVEL = 6
+
+# The LAB pre-step can be split across cores in horizontal strips; strips
+# thinner than this are not worth the thread hand-off.
+MIN_LAB_TILE_ROWS = 64
+
+
+def default_workers() -> int:
+    """One worker per CPU core, capped at AUTO_WORKERS_CAP."""
+    return max(1, min(os.cpu_count() or 1, AUTO_WORKERS_CAP))
 
 
 # Colour palettes for the two UI themes. ttk's 'clam' engine honours these
@@ -143,54 +167,125 @@ def apply_ab_curves(lab, a_lut=None, b_lut=None):
     return Image.merge("LAB", (lightness, a_chan, b_chan))
 
 
-def lab_ab_curve(img, a_points=IDENTITY_POINTS, b_points=IDENTITY_POINTS):
-    """Remap the Lab a* and b* channels of `img` and return an RGB image."""
+def _lab_roundtrip(rgb, a_lut, b_lut):
+    """RGB -> LAB -> remap a*/b* -> RGB, in one piece."""
+    lab = rgb.convert("LAB")
+    return apply_ab_curves(lab, a_lut, b_lut).convert("RGB")
+
+
+def _lab_roundtrip_tiled(rgb, a_lut, b_lut, workers):
+    """`_lab_roundtrip` with the image cut into horizontal strips, converted on
+    `workers` threads.
+
+    Converting to and from Lab is a per-pixel operation, so the strips are
+    independent of each other and the assembled result is byte-identical to
+    the single-piece version (test_lab_tune.py checks this). Each thread
+    returns its own strip and the strips are pasted together here — Pillow
+    images must not be written to from several threads at once.
+    """
+    w, h = rgb.size
+    n_tiles = min(workers, max(1, h // MIN_LAB_TILE_ROWS))
+    if n_tiles <= 1:
+        return _lab_roundtrip(rgb, a_lut, b_lut)
+
+    step = -(-h // n_tiles)                       # ceil division
+    tiles = [(y, min(h, y + step)) for y in range(0, h, step)]
+
+    def job(bounds):
+        y0, y1 = bounds
+        return y0, _lab_roundtrip(rgb.crop((0, y0, w, y1)), a_lut, b_lut)
+
+    with ThreadPoolExecutor(max_workers=len(tiles)) as pool:
+        parts = list(pool.map(job, tiles))
+
+    out = Image.new("RGB", (w, h))
+    for y0, part in parts:
+        out.paste(part, (0, y0))
+    return out
+
+
+def lab_ab_curve(img, a_points=IDENTITY_POINTS, b_points=IDENTITY_POINTS,
+                 tile_workers=1):
+    """Remap the Lab a* and b* channels of `img` and return an RGB image.
+
+    `tile_workers` > 1 spreads the two colour transforms over several cores
+    (the RGB image is cut into strips); the pixels are unaffected.
+    """
     alpha = img.getchannel("A") if "A" in img.getbands() else None
-    lab = img.convert("RGB").convert("LAB")
-    merged = apply_ab_curves(lab, build_curve_lut(a_points),
-                             build_curve_lut(b_points))
-    rgb = merged.convert("RGB")
+    a_lut = build_curve_lut(a_points)
+    b_lut = build_curve_lut(b_points)
+    rgb = img.convert("RGB")
+    if tile_workers > 1:
+        out = _lab_roundtrip_tiled(rgb, a_lut, b_lut, tile_workers)
+    else:
+        out = _lab_roundtrip(rgb, a_lut, b_lut)
     if alpha is not None:
-        rgb.putalpha(alpha)
-    return rgb
+        out.putalpha(alpha)
+    return out
 
 
 def soft_glow(img, blur=3.5, top_opacity=25.0, merged_opacity=80.0,
-              lab_a_points=None, lab_b_points=None):
+              lab_a_points=None, lab_b_points=None, tile_workers=1):
     """Apply the AG Image Tune soft-glow effect to a single image.
 
     When `lab_a_points` / `lab_b_points` are given, the Lab a*/b* channels are
     remapped first (the GIMP "Decompose to LAB + Curves" step). Pass None for
-    a channel to leave it alone.
+    a channel to leave it alone. `tile_workers` only affects that LAB step.
     """
     if lab_a_points or lab_b_points:
         img = lab_ab_curve(img,
                            lab_a_points or IDENTITY_POINTS,
-                           lab_b_points or IDENTITY_POINTS)
+                           lab_b_points or IDENTITY_POINTS,
+                           tile_workers=tile_workers)
     base = img.convert("RGB")
-    dup1 = base.copy()
 
     # Top layer: desaturate (LUMA) -> gaussian blur -> invert.
-    top = ImageOps.grayscale(base).convert("RGB")
+    # The layer is greyscale, so blur and invert run on the single-channel L
+    # copy and are expanded to RGB afterwards. That is bit-identical to
+    # blurring three identical RGB channels (a gaussian blur is per-plane) but
+    # blurs a third of the pixels — the biggest single win, because the blur
+    # dominates the runtime.
+    top = ImageOps.grayscale(base)
     top = top.filter(ImageFilter.GaussianBlur(blur))
-    top = ImageOps.invert(top)
+    top = ImageOps.invert(top).convert("RGB")
 
-    # Merge down #1: dup1 with top at top_opacity.
-    merged = Image.blend(dup1, top, top_opacity / 100.0)
+    # Merge down #1: base with top at top_opacity.
+    merged = Image.blend(base, top, top_opacity / 100.0)
+    del top
 
     # Flatten: base + merged in soft-light mode at merged_opacity.
     soft = ImageChops.soft_light(base, merged)
+    del merged
     return Image.blend(base, soft, merged_opacity / 100.0)
 
 
+def _process_one(f, dst_p, index, total, png_level, kwargs,
+                 is_cancelled=None) -> Optional[str]:
+    """Process one file and return its log line (None: cancelled before start)."""
+    if is_cancelled is not None and is_cancelled():
+        return None
+    with Image.open(f) as im:
+        out = soft_glow(im, **kwargs)
+    out_path = dst_p / f.name
+    if png_level is not None and out_path.suffix.lower() == ".png":
+        out.save(out_path, compress_level=png_level)
+    else:
+        out.save(out_path)
+    return f"[{index}/{total}] {f.name} -> {out_path}"
+
+
 def process_folder(src, dst, on_log=None, on_progress=None, is_cancelled=None,
-                   **kwargs):
+                   workers=None, png_level=None, **kwargs):
     """Process every supported image in src into dst (top level, non-recursive).
 
     Optional callbacks (used by the GUI):
       on_log(str)              — receive each progress/error line (default: print)
       on_progress(done, total) — called after each file (default: no-op)
       is_cancelled() -> bool   — polled before each file; True aborts the run
+
+    `workers` is how many images are processed at once (None/0 = auto, 1 =
+    sequential). Both callbacks are invoked from this thread, in completion
+    order, so the caller does not need to be thread-safe.
     """
     log = on_log if on_log is not None else print
     src_p, dst_p = Path(src), Path(dst)
@@ -207,21 +302,49 @@ def process_folder(src, dst, on_log=None, on_progress=None, is_cancelled=None,
         return
 
     total = len(files)
-    for i, f in enumerate(files, 1):
-        if is_cancelled is not None and is_cancelled():
-            log(f"Cancelled after {i - 1}/{total} image(s).")
-            return
-        try:
-            out = soft_glow(Image.open(f), **kwargs)
-            out_path = dst_p / f.name
-            out.save(out_path)
-            log(f"[{i}/{total}] {f.name} -> {out_path}")
-        except Exception as e:  # noqa: BLE001
-            log(f"[{i}/{total}] ERROR {f.name}: {e}")
-        if on_progress is not None:
-            on_progress(i, total)
+    n_workers = default_workers() if not workers else max(1, int(workers))
+    n_workers = min(n_workers, total)
 
-    log(f"Done: {total} image(s) processed.")
+    if n_workers == 1:
+        for i, f in enumerate(files, 1):
+            if is_cancelled is not None and is_cancelled():
+                log(f"Cancelled after {i - 1}/{total} image(s).")
+                return
+            try:
+                line = _process_one(f, dst_p, i, total, png_level, kwargs)
+                if line is not None:
+                    log(line)
+            except Exception as e:  # noqa: BLE001
+                log(f"[{i}/{total}] ERROR {f.name}: {e}")
+            if on_progress is not None:
+                on_progress(i, total)
+        log(f"Done: {total} image(s) processed.")
+        return
+
+    done = 0
+    skipped = 0
+    with ThreadPoolExecutor(max_workers=n_workers) as pool:
+        futures = {pool.submit(_process_one, f, dst_p, i, total,
+                               png_level, kwargs, is_cancelled): (i, f)
+                   for i, f in enumerate(files, 1)}
+        for fut in as_completed(futures):
+            i, f = futures[fut]
+            done += 1
+            try:
+                line = fut.result()
+            except Exception as e:  # noqa: BLE001
+                line = f"[{i}/{total}] ERROR {f.name}: {e}"
+            if line is None:
+                skipped += 1
+            else:
+                log(line)
+            if on_progress is not None:
+                on_progress(done, total)
+
+    if skipped:
+        log(f"Cancelled after {total - skipped}/{total} image(s).")
+    else:
+        log(f"Done: {total} image(s) processed.")
 
 
 class AgImageApp:
@@ -229,7 +352,7 @@ class AgImageApp:
 
     def __init__(self, root):
         self.root = root
-        root.title("AG Image Tune 2.0 — Batch Soft Glow")
+        root.title("AG Image Tune 2.1 — Batch Soft Glow")
         root.minsize(620, 520)
 
         self.style = ttk.Style(root)
@@ -243,6 +366,12 @@ class AgImageApp:
         self.blur_label = tk.StringVar(value="3.5")
         self.top_label = tk.StringVar(value="25 %")
         self.merged_label = tk.StringVar(value="80 %")
+
+        # Images processed at once; 0 = one per CPU core (default_workers()).
+        self.workers_var = tk.IntVar(value=0)
+        self.workers_label = tk.StringVar(value="")
+        self.workers_var.trace_add("write",
+                                   lambda *_: self._workers_changed())
 
         # LAB chroma curve: 4 numbers per channel (x1, y1, x2, y2).
         self.lab_on = tk.BooleanVar(value=False)
@@ -259,9 +388,10 @@ class AgImageApp:
 
         self._build_toolbar()
         self._build_ui()
-        # Restore the saved LAB points *before* applying the theme, because
+        # Restore the saved settings *before* applying the theme, because
         # _apply_theme saves the current state back to the config file.
         self._load_lab()
+        self._load_workers()
         self._apply_theme(self._load_theme())
 
     # ----- UI construction ------------------------------------------------
@@ -294,6 +424,15 @@ class AgImageApp:
                      0.0, 100.0, lambda v: f"{v:.0f} %")
         self._slider(frm2, 2, "Soft-light opacity", self.merged_var,
                      self.merged_label, 0.0, 100.0, lambda v: f"{v:.0f} %")
+
+        ttk.Label(frm2, text="Parallel workers").grid(
+            row=3, column=0, sticky="w", pady=4)
+        ttk.Spinbox(frm2, from_=0, to=64, width=6, justify="center",
+                    textvariable=self.workers_var,
+                    command=self._workers_changed).grid(
+            row=3, column=1, sticky="w", padx=6)
+        ttk.Label(frm2, textvariable=self.workers_label, width=12,
+                  anchor="e").grid(row=3, column=2)
 
         # LAB chroma curve (optional pre-step)
         frm5 = ttk.LabelFrame(self.root, text="LAB chroma curve (optional)",
@@ -385,6 +524,20 @@ class AgImageApp:
             out.append(points)
         return out[0], out[1]
 
+    # ----- Workers (parallel batch) --------------------------------------
+    def _workers_value(self):
+        """Requested worker count; 0 = auto (one per CPU core)."""
+        try:
+            n = int(self.workers_var.get())
+        except (tk.TclError, ValueError):
+            return 0
+        return max(0, min(n, 64))
+
+    def _workers_changed(self):
+        """Spell out what the number in the spinbox means right now."""
+        n = self._workers_value()
+        self.workers_label.set(f"auto ({default_workers()})" if n == 0 else f"{n}")
+
     def _log(self, msg):
         self.txt.configure(state="normal")
         self.txt.insert("end", msg + "\n")
@@ -415,16 +568,17 @@ class AgImageApp:
         try:
             a_pts, b_pts = self._lab_points()
         except ValueError as e:  # noqa: BLE001
-            messagebox.showerror("LAB chroma curve", str(e))
+            self._alert("error", "LAB chroma curve", str(e))
             return
         try:
             src = Image.open(path)
             result = soft_glow(src, blur=self.blur_var.get(),
                                top_opacity=self.top_var.get(),
                                merged_opacity=self.merged_var.get(),
-                               lab_a_points=a_pts, lab_b_points=b_pts)
+                               lab_a_points=a_pts, lab_b_points=b_pts,
+                               tile_workers=default_workers())
         except Exception as e:  # noqa: BLE001
-            messagebox.showerror("Preview", f"Could not open or process image:\n{e}")
+            self._alert("error", "Preview", f"Could not open or process image:\n{e}")
             return
 
         win = tk.Toplevel(self.root)
@@ -456,27 +610,37 @@ class AgImageApp:
         src = self.src_var.get().strip()
         dst = self.dst_var.get().strip()
         if not src:
-            messagebox.showwarning("Missing source", "Choose the source folder first.")
+            self._alert("warning", "Missing source",
+                        "Choose the source folder first.")
             return
         if not Path(src).is_dir():
-            messagebox.showerror("Bad source", f"Source folder does not exist:\n{src}")
+            self._alert("error", "Bad source",
+                        f"Source folder does not exist:\n{src}")
             return
         if not dst:
-            messagebox.showwarning("Missing destination",
-                                   "Choose the destination folder first.")
+            self._alert("warning", "Missing destination",
+                        "Choose the destination folder first.")
             return
         if Path(src).resolve() == Path(dst).resolve():
-            messagebox.showerror(
-                "Same folder",
+            self._alert(
+                "error", "Same folder",
                 "Source and destination are the same folder.\n"
-                "The originals would be overwritten — choose a different destination.")
+                "The originals would be overwritten — choose a different "
+                "destination.")
             return
 
         try:
             a_pts, b_pts = self._lab_points()
         except ValueError as e:  # noqa: BLE001
-            messagebox.showerror("LAB chroma curve", str(e))
+            self._alert("error", "LAB chroma curve", str(e))
             return
+
+        requested = self._workers_value()
+        file_workers = requested or default_workers()
+        # A folder run already spreads the images over every core, so the
+        # optional LAB pre-step gets the leftover cores per image (usually
+        # one); the single-image Preview gets all of them.
+        tile_workers = max(1, default_workers() // max(1, file_workers))
 
         kwargs = {
             "blur": self.blur_var.get(),
@@ -484,6 +648,7 @@ class AgImageApp:
             "merged_opacity": self.merged_var.get(),
             "lab_a_points": a_pts,
             "lab_b_points": b_pts,
+            "tile_workers": tile_workers,
         }
         self._cancel.clear()
         self._set_running(True)
@@ -492,6 +657,7 @@ class AgImageApp:
         self._log(f"Settings: blur={kwargs['blur']:.1f}, "
                   f"top={kwargs['top_opacity']:.0f}%, "
                   f"merged={kwargs['merged_opacity']:.0f}%")
+        self._log(f"Workers: {file_workers}" + ("" if requested else " (auto)"))
         if a_pts or b_pts:
             for ch, pts in (("A", a_pts), ("B", b_pts)):
                 if pts:
@@ -499,14 +665,17 @@ class AgImageApp:
                               f"{pts[1][0]}->{pts[1][1]}")
                 else:
                     self._log(f"LAB {ch} curve: unchanged")
+            self._log(f"LAB strips per image: {tile_workers}")
         self._save_config()
 
         self._thread = threading.Thread(
-            target=self._worker, args=(src, dst, kwargs), daemon=True)
+            target=self._worker,
+            args=(src, dst, kwargs, file_workers, PNG_COMPRESS_LEVEL),
+            daemon=True)
         self._thread.start()
         self.root.after(80, self._poll)
 
-    def _worker(self, src, dst, kwargs):
+    def _worker(self, src, dst, kwargs, workers, png_level):
         worked = {"any": False}
 
         def on_progress(done, total):
@@ -519,7 +688,7 @@ class AgImageApp:
                 on_log=lambda m: self._queue.put(("log", m)),
                 on_progress=on_progress,
                 is_cancelled=lambda: self._cancel.is_set(),
-                **kwargs)
+                workers=workers, png_level=png_level, **kwargs)
         except Exception as e:  # noqa: BLE001
             self._queue.put(("log", f"FATAL: {e}"))
         finally:
@@ -539,7 +708,8 @@ class AgImageApp:
                     finished = True
                     self._set_running(False)
                     if not self._cancel.is_set() and msg[1]:
-                        messagebox.showinfo("AG Image Tune", "Processing complete.")
+                        self._alert("info", "AG Image Tune",
+                                    "Processing complete.")
         except queue.Empty:
             pass
         if not finished:
@@ -599,7 +769,7 @@ class AgImageApp:
         frm = ttk.Frame(win, padding=20)
         frm.pack(fill="both", expand=True)
 
-        ttk.Label(frm, text="AG Image Tune 2.0",
+        ttk.Label(frm, text="AG Image Tune 2.1",
                   font=("Segoe UI", 13, "bold")).pack(pady=(0, 4))
         ttk.Label(frm, text="Batch soft-glow image processor").pack(
             pady=(0, 14))
@@ -638,6 +808,56 @@ class AgImageApp:
             self._about_win.destroy()
             self._about_win = None
 
+    # ----- Themed message dialog ------------------------------------------
+    def _alert(self, kind, title, text):
+        """Modal, theme-following replacement for tkinter.messagebox.
+
+        Tk's message boxes are drawn by the OS, so on Windows they stay light
+        even with the dark theme selected. This one is built from the same
+        themed widgets as the rest of the window. (The Browse… folder pickers
+        are OS dialogs too and cannot be restyled — that part is up to the
+        system.)
+
+        `kind` only picks the colour of the strip along the top:
+        "info" / "warning" / "error". Tests patch this method — see
+        test_gui_smoke.py.
+        """
+        t = THEMES[self._theme_var.get()]
+        edge = {"info": t["accent"], "warning": "#d08a00",
+                "error": "#c0392b"}.get(kind, t["accent"])
+
+        win = tk.Toplevel(self.root)
+        win.title(title)
+        win.resizable(False, False)
+        win.configure(bg=t["bg"])
+        win.transient(self.root)
+
+        tk.Frame(win, bg=edge, height=3).pack(fill="x")
+        frm = ttk.Frame(win, padding=18)
+        frm.pack(fill="both", expand=True)
+        ttk.Label(frm, text=text, wraplength=380,
+                  justify="left").pack(anchor="w")
+        ok = ttk.Button(frm, text="OK", command=win.destroy)
+        ok.pack(pady=(16, 0))
+
+        win.bind("<Return>", lambda _e: win.destroy())
+        win.bind("<Escape>", lambda _e: win.destroy())
+
+        # Centre over the main window, like the About box.
+        win.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width()
+                                       - win.winfo_reqwidth()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height()
+                                       - win.winfo_reqheight()) // 2
+        win.geometry(f"+{max(0, x)}+{max(0, y)}")
+
+        try:
+            win.grab_set()
+        except tk.TclError:
+            pass
+        ok.focus_set()
+        self.root.wait_window(win)
+
     def _load_theme(self):
         data = self._load_config()
         if data.get("theme") in THEMES:
@@ -661,6 +881,15 @@ class AgImageApp:
             pass
         self._lab_toggle()
 
+    def _load_workers(self):
+        """Restore the worker count; silently ignores anything malformed."""
+        try:
+            n = int(self._load_config().get("workers", 0))
+        except (TypeError, ValueError):
+            n = 0
+        self.workers_var.set(max(0, min(n, 64)))
+        self._workers_changed()
+
     @staticmethod
     def _load_config():
         try:
@@ -673,6 +902,7 @@ class AgImageApp:
         try:
             data = self._load_config()
             data["theme"] = self._theme_var.get()
+            data["workers"] = self._workers_value()
             data["lab"] = {
                 "on": bool(self.lab_on.get()),
                 "points": {ch: [int(v.get()) for v in self.lab_vars[ch]]
@@ -719,6 +949,17 @@ class AgImageApp:
         s.map("TButton",
               background=[("active", t["hover"]), ("pressed", t["hover"]),
                           ("disabled", t["surface_alt"])],
+              foreground=[("disabled", t["disabled_fg"])])
+
+        # ttk.Checkbutton: clam ships its own light trap for this widget class,
+        # and it wins over the '.' settings above — on hover it resolved to
+        # #eeebe7 while the dark theme's label is #e6e6e6, i.e. the text
+        # vanished under the pointer. Pin every state to the palette.
+        s.configure("TCheckbutton", background=t["bg"], foreground=t["fg"],
+                    focuscolor=t["accent"], bordercolor=t["border"])
+        s.map("TCheckbutton",
+              background=[("active", t["hover"]), ("selected", t["bg"]),
+                          ("disabled", t["bg"])],
               foreground=[("disabled", t["disabled_fg"])])
 
         s.configure("TEntry", fieldbackground=t["surface"],
